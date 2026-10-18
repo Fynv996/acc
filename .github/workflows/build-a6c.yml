@@ -1,0 +1,119 @@
+# A6C 坐标 SDK 云编译（GitHub Actions）
+# ---------------------------------------------------------------------------
+# 用途：在 GitHub 的 Linux 机器上用官方 NDK + CMake + Ninja 编出
+#       libA6C.so（含真正的 Capstone + Unicorn），再用 Aide 链接。
+#
+# 用法：
+#   1) 新建一个仓库（private 也行）
+#   2) 上传两样东西：
+#        A6CSDK-2.0.0-source/            （整个目录，约 13MB）
+#        .github/workflows/build-a6c.yml （本文件）
+#      也可以只上传 A6CSDK-2.0.0-source.zip，本工作流会自动解包
+#   3) 打开 Actions -> 左侧 build-a6c -> Run workflow
+#   4) 跑完在页面底部 Artifacts 下载 libA6C-arm64-v8a.zip
+#
+# 产物：libA6C.so（导出 9 个 A6C_* 符号，capstone/unicorn 都静态在里面）
+# ---------------------------------------------------------------------------
+name: build-a6c
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'A6CSDK-2.0.0-source/**'
+      - '*.zip'
+      - '.github/workflows/build-a6c.yml'
+
+env:
+  NDK_VERSION: r26b
+  # 让 unicorn 的 configure 不去找宿主机 pkg-config
+  PKG_CONFIG: 'false'
+
+jobs:
+  android-arm64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 如果上传的是 zip，先解包
+        run: |
+          set -e
+          if [ ! -d A6CSDK-2.0.0-source ]; then
+            for z in *.zip; do
+              [ -f "$z" ] || continue
+              echo "解包 $z"
+              unzip -q "$z"
+            done
+          fi
+          test -d A6CSDK-2.0.0-source || { echo "::error::找不到 A6CSDK-2.0.0-source 目录"; exit 1; }
+          ls -la A6CSDK-2.0.0-source/third_party/sources/
+
+      - name: 安装 ninja / unzip
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ninja-build unzip
+          cmake --version | head -1
+          ninja --version
+
+      - name: 下载 Android NDK
+        run: |
+          set -e
+          url="https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip"
+          echo "下载 $url"
+          for i in 1 2 3; do
+            curl -fL --retry 3 --retry-delay 5 -o /tmp/ndk.zip "$url" && break
+            echo "第 $i 次失败，重试"; sleep 5
+          done
+          unzip -q /tmp/ndk.zip -d "$HOME"
+          echo "ANDROID_NDK_HOME=$HOME/android-ndk-${NDK_VERSION}" >> "$GITHUB_ENV"
+          echo "STRINGS=$HOME/android-ndk-${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strings" >> "$GITHUB_ENV"
+          echo "TOOLBIN=$HOME/android-ndk-${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_ENV"
+
+      - name: 配置（CMake + NDK toolchain）
+        run: |
+          set -e
+          cmake -S A6CSDK-2.0.0-source -B a6c-build -G Ninja \
+            -DCMAKE_MAKE_PROGRAM="$(command -v ninja)" \
+            -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-24 \
+            -DANDROID_STL=c++_static \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DA6C_BUILD_EXAMPLES=OFF \
+            -DA6C_BUILD_TESTS=OFF \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+
+      - name: 编译
+        run: cmake --build a6c-build --parallel 4
+
+      - name: 校验产物
+        run: |
+          set -e
+          echo "=== 找库 ==="
+          find a6c-build -name '*.so' -o -name '*.a' | sort
+          SO="$(find a6c-build -name 'libA6C.so' | head -1)"
+          test -n "$SO" || { echo "::error::没有生成 libA6C.so"; exit 1; }
+          echo "SO=$SO"
+          cp "$SO" libA6C.so
+          ls -l libA6C.so
+          sha256sum libA6C.so | tee libA6C.so.sha256
+          echo "=== 导出符号（应正好 9 个 A6C_*）==="
+          "${TOOLBIN}/llvm-nm" -D --defined-only libA6C.so | grep ' A6C_' | sort
+          echo "=== NEEDED（不该出现 libc++_shared）==="
+          "${TOOLBIN}/llvm-readelf" -d libA6C.so | grep NEEDED
+          echo "=== 架构 ==="
+          "${TOOLBIN}/llvm-readelf" -h libA6C.so | grep -E 'Machine|Class'
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: libA6C-arm64-v8a
+          path: |
+            libA6C.so
+            libA6C.so.sha256
+            a6c-build/**/libA6C_core.a
+          if-no-files-found: warn
+          retention-days: 30
